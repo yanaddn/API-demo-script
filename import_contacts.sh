@@ -2,27 +2,29 @@
 
 set -euo pipefail
 
-readonly SCRIPT_NAME="$(basename "$0")"
-
 # -----------------------------------------------------------------------------
 # Load .env file (if present)
 # -----------------------------------------------------------------------------
 
 if [[ -f ".env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source <(grep -v '^\s*#' .env | grep -v '^\s*$')
-    set +a
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="$(echo "$line" | sed -e 's/\r$//' -e 's/^\s*//' -e 's/\s*$//')"
+        if [[ -n "$line" && ! "$line" =~ ^# && "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            export "$line"
+        fi
+    done < ".env"
 fi
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
 
-COMPANY_URL="${COMPANY_URL:-https://stage.company.com/api}"
-TOKEN="${TOKEN:-}"
+RAW_URL="${COMPANY_URL:-https://stage.company.com}"
+URL="$(echo "$RAW_URL" | tr -d '"' | tr -d "'")"
+TOKEN="$(echo "${TOKEN:-}" | tr -d '"' | tr -d "'")"
 TYPE_ID="${TYPE_ID:-200}"
 BATCH_SIZE="${BATCH_SIZE:-1000}"
+readonly SCRIPT_NAME="$(basename "$0")"
 
 # -----------------------------------------------------------------------------
 # Usage
@@ -31,7 +33,10 @@ BATCH_SIZE="${BATCH_SIZE:-1000}"
 usage() {
     cat <<EOF
 Usage:
-  $SCRIPT_NAME --file <input.xls|input.xlsx|input.csv> --queue-id <queue_id> [options]
+  $SCRIPT_NAME --file <input.xls|input.xlsx> --queue-id <queue_id> [options]
+
+Command example:
+  ./$SCRIPT_NAME --file contacts.xlsx --queue-id 123
 
 Options:
   --file        Input Excel/CSV file
@@ -41,7 +46,7 @@ Options:
   --help        Show this help
 
 Environment / .env:
-  COMPANY_URL   Company API base URL (default: https://stage.Company.com/api)
+  COMPANY_URL   Company API base URL (default: https://stage.company.com/api)
   TOKEN         Company API access token
   TYPE_ID       Communication type ID (default: 200)
   BATCH_SIZE    Chunk size for batch processing (default: 1000)
@@ -49,7 +54,7 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# Arguments Parse
+# Arguments Parsing
 # -----------------------------------------------------------------------------
 
 INPUT_FILE=""
@@ -93,11 +98,13 @@ done
 
 if [[ -z "$INPUT_FILE" ]]; then
     echo "ERROR: --file is required" >&2
+    usage >&2
     exit 1
 fi
 
 if [[ -z "$QUEUE_ID" ]]; then
     echo "ERROR: --queue-id is required" >&2
+    usage >&2
     exit 1
 fi
 
@@ -115,11 +122,20 @@ if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="${INPUT_FILE%.*}_result.txt"
 fi
 
+case "$INPUT_FILE" in
+    *.xls|*.xlsx|*.XLS|*.XLSX)
+        ;;
+    *)
+        echo "ERROR: Only .xls and .xlsx files are supported" >&2
+        exit 1
+        ;;
+esac
+
 # -----------------------------------------------------------------------------
 # Dependency Check
 # -----------------------------------------------------------------------------
 
-for command in mlr jq curl; do
+for command in ssconvert mlr jq curl; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "ERROR: Required command not found: $command" >&2
         exit 1
@@ -131,14 +147,17 @@ done
 # -----------------------------------------------------------------------------
 
 TMP_DIR="$(mktemp -d)"
+
 cleanup() {
     rm -rf "$TMP_DIR"
 }
+
 trap cleanup EXIT
 
 CSV_FILE="$TMP_DIR/contacts.csv"
 RECORDS_FILE="$TMP_DIR/records.json"
 FILTERED_RECORDS="$TMP_DIR/filtered_records.json"
+VALID_ITEMS_FILE="$TMP_DIR/valid_items.json"
 
 # -----------------------------------------------------------------------------
 # Convert Input File to CSV
@@ -148,18 +167,13 @@ echo "Processing input file: $INPUT_FILE"
 
 case "$INPUT_FILE" in
     *.xls|*.xlsx|*.XLS|*.XLSX)
-        if ! command -v ssconvert >/dev/null 2>&1; then
-            echo "ERROR: ssconvert (gnumeric) is required for Excel files." >&2
+        if ! ssconvert --export-type=Gnumeric_stf:stf_csv "$INPUT_FILE" "$CSV_FILE" >/dev/null 2>&1; then
+            echo "ERROR: Failed to convert Excel file to CSV" >&2
             exit 1
         fi
-        ssconvert --export-type=Gnumeric_stf:stf_csv "$INPUT_FILE" "$CSV_FILE" >/dev/null 2>&1
         ;;
     *.csv|*.CSV)
         cp "$INPUT_FILE" "$CSV_FILE"
-        ;;
-    *)
-        echo "ERROR: Unsupported file format. Use .xls, .xlsx, or .csv" >&2
-        exit 1
         ;;
 esac
 
@@ -177,8 +191,10 @@ RAW_NAME_COL=""
 RAW_DEST_COL=""
 
 IFS=',' read -ra COLUMNS <<< "$HEADER"
+
 for column in "${COLUMNS[@]}"; do
     clean_col="$(echo "$column" | tr -d '"' | xargs)"
+
     case "$clean_col" in
         "Name"|"Name / ПІБ"|"Name/ПІБ"|"ПІБ")
             RAW_NAME_COL="$clean_col"
@@ -195,7 +211,7 @@ if [[ -z "$RAW_NAME_COL" || -z "$RAW_DEST_COL" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Normalize Data & Sanitize Phone Numbers (залишаємо лише цифри)
+# Normalize Data & Sanitize Phone Numbers
 # -----------------------------------------------------------------------------
 
 mlr --icsv --ojson cat "$CSV_FILE" > "$RECORDS_FILE"
@@ -206,17 +222,16 @@ jq \
     --arg dest_col "$RAW_DEST_COL" '
 map({
     raw_name: (.[$name_col] // "" | tostring | gsub("^\\s+|\\s+$"; "")),
-    raw_dest: (.[$dest_col] // "" | tostring | gsub("^\\s+|\\s+$"; "")),
-    clean_dest: (.[$dest_col] // "" | tostring | gsub("[^0-9]"; ""))
+    raw_dest: (.[$dest_col] // "" | tostring | gsub("^\\s+|\\s+$"; ""))
 })
 | map(
-    if .raw_name != "" and .clean_dest != "" then
+    if .raw_name != "" and .raw_dest != "" then
         . + {
             valid: true,
             item: {
                 name: .raw_name,
                 communications: [{
-                    destination: .clean_dest,
+                    destination: .raw_dest,
                     type: { id: ($type_id | tonumber) }
                 }]
             }
@@ -240,19 +255,23 @@ if [[ "$VALID_COUNT" -eq 0 ]]; then
     exit 1
 fi
 
-# Ініціалізація лог-файлу результатів
-echo "=== Import Log & Results: $(date) ===" > "$OUTPUT_FILE"
-echo "Source File: $INPUT_FILE" >> "$OUTPUT_FILE"
-echo "Queue ID: $QUEUE_ID" >> "$OUTPUT_FILE"
-echo "--------------------------------------------------" >> "$OUTPUT_FILE"
+{
+    echo "=== Import Log & Results: $(date) ==="
+    echo "Source File: $INPUT_FILE"
+    echo "Queue ID: $QUEUE_ID"
+    echo "--------------------------------------------------"
+} > "$OUTPUT_FILE"
+
+# -----------------------------------------------------------------------------
+# API Request & Dynamic URL Fix
+# -----------------------------------------------------------------------------
+
+HOST_BASE="$(echo "$URL" | sed -E 's|(https?://[^/]+).*|\1|')"
+API_URL="${HOST_BASE}/api/call_center/queues/${QUEUE_ID}/members/bulk"
 
 # -----------------------------------------------------------------------------
 # Batch Processing and API Dispatch
 # -----------------------------------------------------------------------------
-
-CLEAN_BASE_URL="${COMPANY_URL%/call_center/queues/*}"
-CLEAN_BASE_URL="${CLEAN_BASE_URL%/}"
-API_URL="${CLEAN_BASE_URL}/call_center/queues/${QUEUE_ID}/members/bulk"
 
 FILE_NAME="$(basename "$INPUT_FILE")"
 TOTAL_BATCHES=$(( (VALID_COUNT + BATCH_SIZE - 1) / BATCH_SIZE ))
@@ -261,7 +280,6 @@ FAILED_BATCH_COUNT=0
 NETWORK_ERROR_COUNT=0
 HTTP_ERROR_COUNT=0
 
-VALID_ITEMS_FILE="$TMP_DIR/valid_items.json"
 jq '[.[] | select(.valid == true)]' "$FILTERED_RECORDS" > "$VALID_ITEMS_FILE"
 
 echo -e "\nStarting API Batch Processing (${TOTAL_BATCHES} batches)..."
@@ -301,7 +319,7 @@ for (( batch=0; batch<TOTAL_BATCHES; batch++ )); do
             --output "$RESPONSE_FILE" \
             --write-out '%{http_code}' \
             --request POST \
-            --header "X-Company-Access: ${TOKEN}" \
+            --header "X-Webitel-Access: ${TOKEN}" \
             --header "Content-Type: application/json" \
             --data-binary "@$PAYLOAD_FILE" \
             "$API_URL"
@@ -343,7 +361,7 @@ echo -e "\n--- Detailed Item List ---" >> "$OUTPUT_FILE"
 jq -r '
 .[] | 
 if .valid then
-    "SUCCESS | Name: " + .raw_name + " | Phone: " + .clean_dest
+    "SUCCESS | Name: " + .raw_name + " | Phone: " + .raw_dest
 else
     "FAILED  | Name: " + .raw_name + " | Phone: " + .raw_dest + " | Reason: " + .error
 end
@@ -352,18 +370,28 @@ end
 TOTAL_FAILED_API=$((NETWORK_ERROR_COUNT + HTTP_ERROR_COUNT))
 TOTAL_ERRORS=$((INVALID_COUNT + TOTAL_FAILED_API))
 
-echo "--------------------------------------------------" >> "$OUTPUT_FILE"
-echo "SUMMARY:" >> "$OUTPUT_FILE"
-echo "  Total Records in File:   $TOTAL_COUNT" >> "$OUTPUT_FILE"
-echo "  Successfully Processed:  $SUCCESS_COUNT" >> "$OUTPUT_FILE"
-echo "  Total Errors:            $TOTAL_ERRORS" >> "$OUTPUT_FILE"
-echo "    - Validation Errors:   $INVALID_COUNT" >> "$OUTPUT_FILE"
-echo "    - HTTP 4xx/5xx Errors: $HTTP_ERROR_COUNT" >> "$OUTPUT_FILE"
-echo "    - Network/Timeouts:    $NETWORK_ERROR_COUNT" >> "$OUTPUT_FILE"
+{
+    echo "--------------------------------------------------"
+    echo "SUMMARY:"
+    echo "  Total Records in File:   $TOTAL_COUNT"
+    echo "  Successfully Processed:  $SUCCESS_COUNT"
+    echo "  Total Errors:            $TOTAL_ERRORS"
+    echo "    - Validation Errors:   $INVALID_COUNT"
+    echo "    - HTTP 4xx/5xx Errors: $HTTP_ERROR_COUNT"
+    echo "    - Network/Timeouts:    $NETWORK_ERROR_COUNT"
+} >> "$OUTPUT_FILE"
 
 # -----------------------------------------------------------------------------
 # Final Console Output
 # -----------------------------------------------------------------------------
 
-echo "Import Finished!"
-echo "Results Log: $OUTPUT_FILE"
+if [[ "$DRY_RUN" == true ]]; then
+    echo "Dry run finished!"
+elif [[ "$TOTAL_FAILED_API" -eq 0 ]]; then
+    echo "Import Finished Successfully!"
+    echo "Results Log: $OUTPUT_FILE"
+else
+    echo "ERROR: Import finished with API errors." >&2
+    echo "Results Log: $OUTPUT_FILE" >&2
+    exit 1
+fi
