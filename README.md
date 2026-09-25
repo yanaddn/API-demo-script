@@ -1,7 +1,7 @@
 # Working with API
 Automated Bash script for normalizing and bulk-importing contacts from Excel files into API.
 
-The script automatically:
+The `import_contacts.sh` script does the following:
 - Normalizes and sanitizes phone numbers (removes `+`, spaces, hyphens, and brackets, leaving digits only).
 - Validates required fields (Full Name and Phone Number).
 - Splits large lists into batches (chunks) for safe API transmission.
