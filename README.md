@@ -1,4 +1,4 @@
-# test-task
+# Working with API
 Automated Bash script for normalizing and bulk-importing contacts from Excel files into API.
 
 The script automatically:
